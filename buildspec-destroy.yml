@@ -1,0 +1,22 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz"
+      - tar xzf eksctl_Linux_amd64.tar.gz -C /usr/local/bin
+      - curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+      - install -m 0755 kubectl /usr/local/bin/kubectl
+
+  build:
+    commands:
+      - echo "Destroying EKS cluster..."
+      # Delete Kubernetes resources first to trigger LB/ENI cleanup
+      - eksctl get cluster --name lab-cluster --region "$AWS_REGION" &&
+          kubectl delete svc --all-namespaces -l app.kubernetes.io/managed-by!=eksctl --wait=true --timeout=120s || true
+      # Then delete the cluster (handles nodegroups -> cluster -> VPC ordering)
+      - eksctl delete cluster -f example/cluster.yaml --wait --force
+
+  post_build:
+    commands:
+      - echo "Cluster destruction complete"

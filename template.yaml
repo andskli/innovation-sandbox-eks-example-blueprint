@@ -1,0 +1,329 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Innovation Sandbox Blueprint — EKS lab example.
+  Deploys a CodeBuild project that provisions/destroys an EKS cluster
+  using eksctl, orchestrated by Step Functions for reliable timeout handling.
+
+Parameters:
+  SourceBucket:
+    Type: String
+    Description: S3 bucket containing the packaged source artifact (zip)
+  SourceKey:
+    Type: String
+    Description: S3 key for the source artifact
+    Default: blueprint/source.zip
+  BuildTimeout:
+    Type: Number
+    Default: 30
+    Description: CodeBuild timeout in minutes
+
+Resources:
+
+  # --- IAM role for CodeBuild ---
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Broad permissions for lab provisioning. Scope down for production use.
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # --- CodeBuild project ---
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-builder"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: !Ref BuildTimeout
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        Type: LINUX_CONTAINER
+      Source:
+        Type: S3
+        Location: !Sub "${SourceBucket}/${SourceKey}"
+      Artifacts:
+        Type: NO_ARTIFACTS
+
+  # --- Step Functions execution role ---
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Orchestration
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StopBuild
+                Resource: !GetAtt BuildProject.Arn
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CfnResponseFunction.Arn
+
+  # --- State machine — orchestrates CodeBuild and sends CFN response ---
+  BuildStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Orchestrate CodeBuild for CFN custom resource with timeout handling",
+          "TimeoutSeconds": 3600,
+          "StartAt": "RouteByRequestType",
+          "States": {
+            "RouteByRequestType": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.RequestType",
+                  "StringEquals": "Update",
+                  "Next": "SendSuccess"
+                },
+                {
+                  "Variable": "$.RequestType",
+                  "StringEquals": "Delete",
+                  "Next": "StartDestroyBuild"
+                }
+              ],
+              "Default": "StartCreateBuild"
+            },
+
+            "StartCreateBuild": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:codebuild:startBuild",
+              "Parameters": {
+                "ProjectName": "${BuildProject}",
+                "BuildspecOverride": "buildspec-create.yml"
+              },
+              "ResultPath": "$.BuildResult",
+              "Next": "InitPoll",
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.Error", "Next": "HandleError" }]
+            },
+
+            "StartDestroyBuild": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:codebuild:startBuild",
+              "Parameters": {
+                "ProjectName": "${BuildProject}",
+                "BuildspecOverride": "buildspec-destroy.yml"
+              },
+              "ResultPath": "$.BuildResult",
+              "Next": "InitPoll",
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.Error", "Next": "HandleError" }]
+            },
+
+            "InitPoll": {
+              "Type": "Pass",
+              "Parameters": {
+                "BuildId.$": "$.BuildResult.Build.Id"
+              },
+              "ResultPath": "$.Poll",
+              "Next": "WaitBeforePoll"
+            },
+
+            "WaitBeforePoll": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "PollBuildStatus"
+            },
+
+            "PollBuildStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:codebuild:batchGetBuilds",
+              "Parameters": { "Ids.$": "States.Array($.Poll.BuildId)" },
+              "ResultPath": "$.PollResult",
+              "Next": "EvaluateBuildStatus",
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.Error", "Next": "HandleError" }]
+            },
+
+            "EvaluateBuildStatus": {
+              "Type": "Choice",
+              "Choices": [
+                { "Variable": "$.PollResult.Builds[0].BuildStatus", "StringEquals": "SUCCEEDED", "Next": "SendSuccess" },
+                { "Variable": "$.PollResult.Builds[0].BuildStatus", "StringEquals": "FAILED", "Next": "BuildFailed" },
+                { "Variable": "$.PollResult.Builds[0].BuildStatus", "StringEquals": "STOPPED", "Next": "BuildFailed" },
+                { "Variable": "$.PollResult.Builds[0].BuildStatus", "StringEquals": "FAULT", "Next": "BuildFailed" },
+                { "Variable": "$.PollResult.Builds[0].BuildStatus", "StringEquals": "TIMED_OUT", "Next": "BuildFailed" }
+              ],
+              "Default": "WaitBeforePoll"
+            },
+
+            "BuildFailed": {
+              "Type": "Pass",
+              "Parameters": {
+                "ErrorMessage.$": "States.Format('Build {} status: {}', $.Poll.BuildId, $.PollResult.Builds[0].BuildStatus)"
+              },
+              "ResultPath": "$.Error",
+              "Next": "HandleError"
+            },
+
+            "HandleError": {
+              "Type": "Pass",
+              "Comment": "All errors (Create or Delete) report FAILED. aws-nuke handles residual cleanup.",
+              "Next": "SendFailure"
+            },
+
+            "SendSuccess": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${CfnResponseFunction}",
+                "Payload": {
+                  "ResponseURL.$": "$.ResponseURL",
+                  "Status": "SUCCESS",
+                  "Reason": "OK",
+                  "PhysicalResourceId.$": "States.Format('blueprint-{}', $.LogicalResourceId)",
+                  "StackId.$": "$.StackId",
+                  "RequestId.$": "$.RequestId",
+                  "LogicalResourceId.$": "$.LogicalResourceId"
+                }
+              },
+              "End": true,
+              "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }]
+            },
+
+            "SendFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${CfnResponseFunction}",
+                "Payload": {
+                  "ResponseURL.$": "$.ResponseURL",
+                  "Status": "FAILED",
+                  "Reason.$": "$.Error.ErrorMessage",
+                  "PhysicalResourceId.$": "States.Format('blueprint-{}', $.LogicalResourceId)",
+                  "StackId.$": "$.StackId",
+                  "RequestId.$": "$.RequestId",
+                  "LogicalResourceId.$": "$.LogicalResourceId"
+                }
+              },
+              "End": true,
+              "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }]
+            }
+          }
+        }
+
+  # --- Lambda: thin trigger (starts Step Functions from CFN event) ---
+  TriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StartStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref BuildStateMachine
+
+  TriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt TriggerRole.Arn
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref BuildStateMachine
+      Code:
+        ZipFile: |
+          import json, logging, os, boto3
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          sfn = boto3.client("stepfunctions")
+
+          def handler(event, context):
+              logger.info("Event: %s", json.dumps(event))
+              sfn.start_execution(
+                  stateMachineArn=os.environ["STATE_MACHINE_ARN"],
+                  input=json.dumps(event)
+              )
+
+  # --- Lambda: CFN response sender (called by Step Functions) ---
+  CfnResponseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  CfnResponseFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt CfnResponseRole.Arn
+      Code:
+        ZipFile: |
+          import json, urllib.request
+
+          def handler(event, context):
+              body = {k: event[k] for k in
+                  ["Status", "Reason", "PhysicalResourceId", "StackId", "RequestId", "LogicalResourceId"]}
+              req = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=json.dumps(body).encode(),
+                  method="PUT"
+              )
+              req.add_header("Content-Type", "")
+              urllib.request.urlopen(req)
+
+  # --- Custom resource ---
+  LabProvisioner:
+    Type: Custom::LabProvisioner
+    Properties:
+      ServiceToken: !GetAtt TriggerFunction.Arn
+      ProjectName: !Ref BuildProject
+
+Outputs:
+  CodeBuildProject:
+    Value: !Ref BuildProject
+  CodeBuildLogGroup:
+    Value: !Sub "/aws/codebuild/${BuildProject}"
+  StateMachine:
+    Value: !Ref BuildStateMachine

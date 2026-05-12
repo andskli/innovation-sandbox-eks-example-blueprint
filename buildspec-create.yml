@@ -1,0 +1,16 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz"
+      - tar xzf eksctl_Linux_amd64.tar.gz -C /usr/local/bin
+
+  build:
+    commands:
+      - echo "Creating EKS cluster..."
+      - eksctl create cluster -f example/cluster.yaml
+
+  post_build:
+    commands:
+      - echo "Cluster creation complete"
