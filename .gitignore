@@ -3,3 +3,6 @@
 .terraform/
 *.tfstate*
 .terraform.lock.hcl
+
+# Local-only Terraform var overrides (account-internal tags etc.) — never commit
+*.auto.tfvars

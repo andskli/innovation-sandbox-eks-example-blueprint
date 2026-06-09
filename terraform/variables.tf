@@ -14,3 +14,9 @@ variable "cluster_version" {
   type        = string
   default     = null
 }
+
+variable "default_tags" {
+  description = "Tags applied to all resources via the provider default_tags block. Consumers can inject their own (e.g. cost-center, owner)."
+  type        = map(string)
+  default     = {}
+}
