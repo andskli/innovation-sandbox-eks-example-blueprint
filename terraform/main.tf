@@ -27,13 +27,19 @@ data "aws_availability_zones" "available" {
 
 locals {
   azs = slice(data.aws_availability_zones.available.names, 0, 3)
+
+  # Per-deployment suffix keeps account-scoped names (cluster, KMS alias) from
+  # colliding with residue an imperfect aws-nuke pass may leave in a recycled
+  # account. Falls back to the bare name for standalone use.
+  name_suffix  = var.deploy_id != "" ? substr(replace(var.deploy_id, "-", ""), 0, 8) : ""
+  cluster_name = local.name_suffix != "" ? "${var.cluster_name}-${local.name_suffix}" : var.cluster_name
 }
 
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 5.0"
 
-  name = "${var.cluster_name}-vpc"
+  name = "${local.cluster_name}-vpc"
   cidr = "10.0.0.0/16"
 
   azs             = local.azs
@@ -57,7 +63,7 @@ module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "~> 20.0"
 
-  cluster_name    = var.cluster_name
+  cluster_name    = local.cluster_name
   cluster_version = var.cluster_version
 
   vpc_id     = module.vpc.vpc_id
